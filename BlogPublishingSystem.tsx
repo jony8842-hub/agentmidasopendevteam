@@ -23,7 +23,7 @@ export interface BlogPost {
 
 export interface BlogPublishingSystemProps {
   initialPosts?: BlogPost[];
-  onChange?: (posts: BlogPost[]) => void;
+  onChange?: (posts: BlogPost[]) => void | Promise<void>;
 }
 
 const seedPosts: BlogPost[] = [
@@ -85,41 +85,120 @@ function formatDate(value: string | null) {
   );
 }
 
+function toLocalDateTimeInput(value: string | null) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function fromLocalDateTimeInput(value: string) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 function statusLabel(status: BlogPostStatus) {
   return status === 'published' ? 'Published' : status === 'scheduled' ? 'Scheduled' : 'Draft';
 }
 
-function renderMarkdown(content: string): ReactNode {
-  return content.split('\n').map((line, index) => {
-    const key = `${index}-${line}`;
-    if (line.startsWith('# ')) {
-      return (
-        <h2 key={key} className="mt-5 text-2xl font-semibold text-[#F5F5F5] first:mt-0">
-          {line.slice(2)}
-        </h2>
-      );
+function renderInlineMarkdown(value: string, keyPrefix: string): ReactNode {
+  const pattern = /(`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_)/g;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let partIndex = 0;
+  while ((match = pattern.exec(value)) !== null) {
+    if (match.index > cursor) parts.push(value.slice(cursor, match.index));
+    const token = match[0];
+    const key = `${keyPrefix}-${partIndex}`;
+    if (token.startsWith('`')) {
+      parts.push(<code key={key} className="rounded bg-[#191919] px-1.5 py-0.5 font-mono text-sm text-[#E8C547]">{token.slice(1, -1)}</code>);
+    } else if (token.startsWith('[')) {
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
+      if (link) {
+        parts.push(<a key={key} href={link[2]} target="_blank" rel="noreferrer" className="text-[#E8C547] underline underline-offset-2">{link[1]}</a>);
+      }
+    } else if (token.startsWith('**') || token.startsWith('__')) {
+      parts.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    } else {
+      parts.push(<em key={key}>{token.slice(1, -1)}</em>);
     }
-    if (line.startsWith('## ')) {
-      return (
-        <h3 key={key} className="mt-5 text-xl font-semibold text-[#F5F5F5] first:mt-0">
-          {line.slice(3)}
-        </h3>
-      );
+    cursor = match.index + token.length;
+    partIndex += 1;
+  }
+  if (cursor < value.length) parts.push(value.slice(cursor));
+  return parts;
+}
+
+function renderMarkdown(content: string): ReactNode {
+  const lines = content.split('\n');
+  const blocks: ReactNode[] = [];
+  let index = 0;
+  let blockIndex = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    const key = `block-${blockIndex}`;
+    if (!line.trim()) {
+      blocks.push(<div key={key} className="h-2" aria-hidden="true" />);
+      index += 1;
+      blockIndex += 1;
+      continue;
+    }
+    if (line.startsWith('```')) {
+      const language = line.slice(3).trim();
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !lines[index].startsWith('```')) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push(<pre key={key} className="my-4 overflow-x-auto rounded-xl bg-[#050505] p-4 text-sm text-[#E8C547]"><code data-language={language || undefined}>{code.join('\n')}</code></pre>);
+      blockIndex += 1;
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const Heading = heading[1].length === 1 ? 'h2' : heading[1].length === 2 ? 'h3' : 'h4';
+      blocks.push(<Heading key={key} className="mt-5 text-xl font-semibold text-[#F5F5F5] first:mt-0">{renderInlineMarkdown(heading[2], key)}</Heading>);
+      index += 1;
+      blockIndex += 1;
+      continue;
     }
     if (line.startsWith('> ')) {
-      return (
-        <blockquote key={key} className="my-3 border-l-2 border-[#D4AF37] pl-4 text-[#E8C547]">
-          {line.slice(2)}
-        </blockquote>
-      );
+      blocks.push(<blockquote key={key} className="my-3 border-l-2 border-[#D4AF37] pl-4 text-[#E8C547]">{renderInlineMarkdown(line.slice(2), key)}</blockquote>);
+      index += 1;
+      blockIndex += 1;
+      continue;
     }
-    if (!line.trim()) return <div key={key} className="h-2" aria-hidden="true" />;
-    return (
-      <p key={key} className="mt-3 leading-7 text-[#C4C4C4]">
-        {line}
-      </p>
-    );
-  });
+    const unordered = line.match(/^\s*[-*]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      const items: string[] = [];
+      const orderedList = Boolean(ordered);
+      while (index < lines.length) {
+        const item = lines[index].match(orderedList ? /^\s*\d+[.)]\s+(.+)$/ : /^\s*[-*]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      const List = orderedList ? 'ol' : 'ul';
+      blocks.push(<List key={key} className={`${orderedList ? 'list-decimal' : 'list-disc'} my-3 space-y-1 pl-6 text-[#C4C4C4]`}>{items.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-${itemIndex}`)}</li>)}</List>);
+      blockIndex += 1;
+      continue;
+    }
+    const paragraph: string[] = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^(#{1,3})\s+|^>\s|^```|^\s*[-*]\s+|^\s*\d+[.)]\s+/.test(lines[index])) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    blocks.push(<p key={key} className="mt-3 leading-7 text-[#C4C4C4]">{renderInlineMarkdown(paragraph.join(' '), key)}</p>);
+    blockIndex += 1;
+  }
+  return blocks;
 }
 
 function emptyDraft(): Omit<BlogPost, 'id' | 'views' | 'reads' | 'shares'> {
@@ -145,8 +224,11 @@ export function BlogPublishingSystem({
   const [activeTab, setActiveTab] = useState<'editor' | 'posts' | 'analytics'>('editor');
   const [activeId, setActiveId] = useState<string | null>(initialPosts[0]?.id ?? null);
   const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | BlogPostStatus>('all');
   const [tagInput, setTagInput] = useState('');
   const [savedNotice, setSavedNotice] = useState('');
+  const [saveError, setSaveError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
   const [draft, setDraft] = useState<Omit<BlogPost, 'id' | 'views' | 'reads' | 'shares'>>(
     initialPosts[0] ? { ...initialPosts[0], tags: [...initialPosts[0].tags] } : emptyDraft(),
   );
@@ -154,9 +236,12 @@ export function BlogPublishingSystem({
   const activePost = activeId ? posts.find((post) => post.id === activeId) ?? null : null;
   const filteredPosts = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return posts;
-    return posts.filter((post) => `${post.title} ${post.excerpt} ${post.tags.join(' ')}`.toLowerCase().includes(needle));
-  }, [posts, query]);
+    return posts.filter((post) => {
+      const matchesStatus = statusFilter === 'all' || post.status === statusFilter;
+      const matchesQuery = !needle || `${post.title} ${post.excerpt} ${post.tags.join(' ')}`.toLowerCase().includes(needle);
+      return matchesStatus && matchesQuery;
+    });
+  }, [posts, query, statusFilter]);
   const totals = useMemo(
     () =>
       posts.reduce(
@@ -166,9 +251,23 @@ export function BlogPublishingSystem({
     [posts],
   );
 
-  const updatePosts = (nextPosts: BlogPost[]) => {
+  const updatePosts = async (nextPosts: BlogPost[], successNotice: string) => {
+    const previousPosts = posts;
     setPosts(nextPosts);
-    onChange?.(nextPosts);
+    setSaveError('');
+    setIsSaving(true);
+    try {
+      await onChange?.(nextPosts);
+      setSavedNotice(successNotice);
+      return true;
+    } catch (error) {
+      setPosts(previousPosts);
+      setSaveError(error instanceof Error ? error.message : 'Could not save changes.');
+      setSavedNotice('');
+      return false;
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const selectPost = (post: BlogPost) => {
@@ -185,9 +284,10 @@ export function BlogPublishingSystem({
     setActiveTab('editor');
   };
 
-  const saveDraft = (
+  const saveDraft = async (
     event?: FormEvent,
     override?: Omit<BlogPost, 'id' | 'views' | 'reads' | 'shares'>,
+    successNotice = 'Draft saved',
   ) => {
     event?.preventDefault();
     const source = override ?? draft;
@@ -206,27 +306,24 @@ export function BlogPublishingSystem({
     const next = activeId ? posts.map((item) => (item.id === activeId ? post : item)) : [post, ...posts];
     setActiveId(post.id);
     setDraft({ ...post, tags: [...post.tags] });
-    updatePosts(next);
-    setSavedNotice('Draft saved');
+    return updatePosts(next, successNotice);
   };
 
-  const publishNow = () => {
+  const publishNow = async () => {
     const publishedAt = new Date().toISOString();
     const nextDraft = { ...draft, status: 'published' as const, publishedAt, scheduledFor: null };
     setDraft(nextDraft);
-    window.setTimeout(() => saveDraft(undefined, nextDraft), 0);
-    setSavedNotice('Published');
+    await saveDraft(undefined, nextDraft, 'Published');
   };
 
-  const schedulePost = () => {
-    if (!draft.scheduledFor) {
+  const schedulePost = async () => {
+    if (!draft.scheduledFor || new Date(draft.scheduledFor).getTime() <= Date.now()) {
       setSavedNotice('Choose a date and time first');
       return;
     }
     const nextDraft = { ...draft, status: 'scheduled' as const, publishedAt: null };
     setDraft(nextDraft);
-    window.setTimeout(() => saveDraft(undefined, nextDraft), 0);
-    setSavedNotice('Post scheduled');
+    await saveDraft(undefined, nextDraft, 'Post scheduled');
   };
 
   const addTag = () => {
@@ -274,10 +371,11 @@ export function BlogPublishingSystem({
             <aside className="space-y-5">
               <div className="rounded-2xl border border-[#2A2A2A] bg-[#0D0D0D] p-5">
                 <h2 className="text-sm font-semibold uppercase tracking-wide text-[#D4AF37]">Release</h2>
-                <div className="mt-4 grid gap-2"><button type="button" onClick={publishNow} className="rounded-xl bg-[#D4AF37] px-4 py-2.5 text-sm font-semibold text-[#0A0A0A] hover:bg-[#E8C547] focus:outline-none focus:ring-2 focus:ring-[#D4AF37]">Publish now</button><button type="button" onClick={schedulePost} className="rounded-xl border border-[#D4AF37] px-4 py-2.5 text-sm font-semibold text-[#E8C547] hover:bg-[#141414] focus:outline-none focus:ring-2 focus:ring-[#D4AF37]">Schedule post</button><button type="submit" className="rounded-xl border border-[#2A2A2A] px-4 py-2.5 text-sm font-semibold text-[#F5F5F5] hover:bg-[#141414] focus:outline-none focus:ring-2 focus:ring-[#D4AF37]">Save draft</button></div>
+                <div className="mt-4 grid gap-2"><button type="button" onClick={publishNow} disabled={isSaving} className="rounded-xl bg-[#D4AF37] px-4 py-2.5 text-sm font-semibold text-[#0A0A0A] hover:bg-[#E8C547] focus:outline-none focus:ring-2 focus:ring-[#D4AF37] disabled:cursor-wait disabled:opacity-60">{isSaving ? 'Saving…' : 'Publish now'}</button><button type="button" onClick={schedulePost} disabled={isSaving} className="rounded-xl border border-[#D4AF37] px-4 py-2.5 text-sm font-semibold text-[#E8C547] hover:bg-[#141414] focus:outline-none focus:ring-2 focus:ring-[#D4AF37] disabled:cursor-wait disabled:opacity-60">Schedule post</button><button type="submit" disabled={isSaving} className="rounded-xl border border-[#2A2A2A] px-4 py-2.5 text-sm font-semibold text-[#F5F5F5] hover:bg-[#141414] focus:outline-none focus:ring-2 focus:ring-[#D4AF37] disabled:cursor-wait disabled:opacity-60">Save draft</button></div>
                 <label htmlFor="blog-schedule" className="mt-4 block text-sm font-medium">Scheduled date and time</label>
-                <input id="blog-schedule" type="datetime-local" value={draft.scheduledFor ? draft.scheduledFor.slice(0, 16) : ''} onChange={(event) => setDraft({ ...draft, scheduledFor: event.target.value ? new Date(event.target.value).toISOString() : null })} className="mt-2 w-full rounded-xl border border-[#2A2A2A] bg-[#0A0A0A] px-3 py-2.5 text-sm outline-none focus:border-[#D4AF37] focus:ring-2 focus:ring-[#D4AF37]/30" />
+                <input id="blog-schedule" type="datetime-local" value={toLocalDateTimeInput(draft.scheduledFor)} onChange={(event) => setDraft({ ...draft, scheduledFor: fromLocalDateTimeInput(event.target.value) })} className="mt-2 w-full rounded-xl border border-[#2A2A2A] bg-[#0A0A0A] px-3 py-2.5 text-sm outline-none focus:border-[#D4AF37] focus:ring-2 focus:ring-[#D4AF37]/30" />
                 {savedNotice && <p role="status" className="mt-3 text-sm text-[#E8C547]">{savedNotice}</p>}
+                {saveError && <p role="alert" className="mt-3 text-sm text-rose-300">{saveError}</p>}
               </div>
               <div className="rounded-2xl border border-[#2A2A2A] bg-[#0D0D0D] p-5">
                 <h2 className="text-sm font-semibold uppercase tracking-wide text-[#D4AF37]">SEO</h2>
@@ -294,7 +392,7 @@ export function BlogPublishingSystem({
         )}
 
         {activeTab === 'posts' && (
-          <div className="rounded-2xl border border-[#2A2A2A] bg-[#0D0D0D] p-5"><div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center"><div><h2 className="text-xl font-semibold">All posts</h2><p className="mt-1 text-sm text-[#9CA3AF]">Draft, schedule, and revisit published work from one place.</p></div><input aria-label="Search posts" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search posts" className="rounded-xl border border-[#2A2A2A] bg-[#0A0A0A] px-3 py-2 text-sm outline-none focus:border-[#D4AF37]" /></div><div className="mt-5 overflow-x-auto"><table className="w-full min-w-[620px] text-left text-sm"><thead className="border-b border-[#2A2A2A] text-xs uppercase tracking-wide text-[#9CA3AF]"><tr><th className="px-3 py-3">Post</th><th className="px-3 py-3">Status</th><th className="px-3 py-3">Date</th><th className="px-3 py-3 text-right">Views</th></tr></thead><tbody>{filteredPosts.map((post) => <tr key={post.id} className="border-b border-[#2A2A2A] last:border-0"><td className="px-3 py-4"><button type="button" onClick={() => selectPost(post)} className="font-medium text-[#F5F5F5] underline-offset-4 hover:text-[#E8C547] hover:underline">{post.title}</button><p className="mt-1 text-xs text-[#9CA3AF]">/{post.slug}</p></td><td className="px-3 py-4"><span className={`rounded-full px-2.5 py-1 text-xs ${post.status === 'published' ? 'bg-emerald-950 text-emerald-300' : post.status === 'scheduled' ? 'bg-blue-950 text-blue-300' : 'bg-[#141414] text-[#C4C4C4]'}`}>{statusLabel(post.status)}</span></td><td className="px-3 py-4 text-[#9CA3AF]">{formatDate(post.publishedAt ?? post.scheduledFor)}</td><td className="px-3 py-4 text-right text-[#C4C4C4]">{post.views.toLocaleString()}</td></tr>)}</tbody></table>{filteredPosts.length === 0 && <p className="py-10 text-center text-sm text-[#9CA3AF]">No posts match that search.</p>}</div></div>
+          <div className="rounded-2xl border border-[#2A2A2A] bg-[#0D0D0D] p-5"><div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center"><div><h2 className="text-xl font-semibold">All posts</h2><p className="mt-1 text-sm text-[#9CA3AF]">Draft, schedule, and revisit published work from one place.</p></div><div className="flex flex-col gap-2 sm:flex-row"><input aria-label="Search posts" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search posts" className="rounded-xl border border-[#2A2A2A] bg-[#0A0A0A] px-3 py-2 text-sm outline-none focus:border-[#D4AF37]" /><select aria-label="Filter posts by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as 'all' | BlogPostStatus)} className="rounded-xl border border-[#2A2A2A] bg-[#0A0A0A] px-3 py-2 text-sm outline-none focus:border-[#D4AF37]"><option value="all">All statuses</option><option value="draft">Drafts</option><option value="scheduled">Scheduled</option><option value="published">Published</option></select></div></div><div className="mt-5 overflow-x-auto"><table className="w-full min-w-[620px] text-left text-sm"><thead className="border-b border-[#2A2A2A] text-xs uppercase tracking-wide text-[#9CA3AF]"><tr><th className="px-3 py-3">Post</th><th className="px-3 py-3">Status</th><th className="px-3 py-3">Date</th><th className="px-3 py-3 text-right">Views</th></tr></thead><tbody>{filteredPosts.map((post) => <tr key={post.id} className="border-b border-[#2A2A2A] last:border-0"><td className="px-3 py-4"><button type="button" onClick={() => selectPost(post)} className="font-medium text-[#F5F5F5] underline-offset-4 hover:text-[#E8C547] hover:underline">{post.title}</button><p className="mt-1 text-xs text-[#9CA3AF]">/{post.slug}</p></td><td className="px-3 py-4"><span className={`rounded-full px-2.5 py-1 text-xs ${post.status === 'published' ? 'bg-emerald-950 text-emerald-300' : post.status === 'scheduled' ? 'bg-blue-950 text-blue-300' : 'bg-[#141414] text-[#C4C4C4]'}`}>{statusLabel(post.status)}</span></td><td className="px-3 py-4 text-[#9CA3AF]">{formatDate(post.publishedAt ?? post.scheduledFor)}</td><td className="px-3 py-4 text-right text-[#C4C4C4]">{post.views.toLocaleString()}</td></tr>)}</tbody></table>{filteredPosts.length === 0 && <p className="py-10 text-center text-sm text-[#9CA3AF]">No posts match that search.</p>}</div></div>
         )}
 
         {activeTab === 'analytics' && (
